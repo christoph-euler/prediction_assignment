@@ -1,0 +1,209 @@
+---
+title: "Prediction of exercise execution"
+author: "C. Euler"
+date: "December 4, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(caret)
+require(corrplot)
+require(knitr)
+require(party)
+require(xgboost)
+```
+
+# Summary
+Here, I report on four classification models of weight lifting exercise performances. The models are a classification tree, two xgboost models and a combination of all models. The performance of the classification tree is lower than the single or combined xgboost models. The stacked model even outperformes these by a minor value and arrives at 99.8% true positive rate.
+
+# Data set
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways.
+(Source: Coursera Assignment Page)
+
+# Data acquisition and preparation
+Before modeling I obtain data and perform a brief analysis as well as data preparation.
+
+## Data acquisition
+Data are acquired from the URLs provided in the exercise description.
+
+```{r data, cache=TRUE}
+trainUrl <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testUrl <- "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+training <- read.csv("D:/Users/ceuler/Documents/2 DataScience/coursera/course_08_week_04/assignment/pml-training.csv", 
+                     na.strings=c("NA","#DIV/0!","")) # for online change to url(trainUrl)
+testing <- read.csv("D:/Users/ceuler/Documents/2 DataScience/coursera/course_08_week_04/assignment/pml-testing.csv", 
+                    na.strings=c("NA","#DIV/0!","")) # for online source change to url(testUrl)
+```
+
+## Data preparation
+For data preparation, 
+* I eliminate columns 1 and 2 (the row number and a name), 
+* remove near-zero variance columns,
+* disregard columns with more than 90% missing values,
+* and impute the missing values with the mean.
+
+Then I convert the classe variable that has values A, B, C, D and E into numbers one to five and convert to a factor.
+
+Finally, I provide a correlation analysis.
+
+```{r data_prep, cache=TRUE}
+# Remove ID (col 1)
+training <- training[-c(1,2)]
+inTrain <- createDataPartition(y=training$classe, p=0.6, list=FALSE)
+train <- training[inTrain, ]
+test <- training[-inTrain, ]
+
+# Removing near zero variance variables
+train.NZV <- nearZeroVar(train, saveMetrics=TRUE)
+train <- train[-which(colnames(train) %in% row.names(train.NZV)[which(train.NZV$nzv==TRUE)])]
+
+# Find fraction of NAs in each column
+train.na_frac <- sapply(train, function(x){length(which(is.na(x)))})/nrow(train)
+
+# Columns are either almost empty or almost always filled. Removing all columns with fraction > 90%
+train <- train[-which(train.na_frac>0.9)]
+
+# Do this transformation also for the test set
+test <- test[colnames(test) %in% colnames(train)]
+
+# Remove NAs by setting to mean
+for (i in 1:(ncol(train)-1)){
+  train[which(is.na(train[,i])),i] <- mean(train[,i], na.rm=TRUE)
+  test[which(is.na(test[,i])),i] <- mean(test[,i], na.rm=TRUE)
+}
+
+# Convert classe to numeric
+train$type <- 0
+train$type[which(train$classe=="A")] <- 1
+train$type[which(train$classe=="B")] <- 2
+train$type[which(train$classe=="C")] <- 3
+train$type[which(train$classe=="D")] <- 4
+train$type[which(train$classe=="E")] <- 5
+train$type <- factor(train$type)
+
+test$type <- 0
+test$type[which(test$classe=="A")] <- 1
+test$type[which(test$classe=="B")] <- 2
+test$type[which(test$classe=="C")] <- 3
+test$type[which(test$classe=="D")] <- 4
+test$type[which(test$classe=="E")] <- 5
+test$type <- factor(test$type)
+
+# Remove classe and user_name
+train <- train[-57]
+test <- test[-57]
+
+## Correlation analysis
+corrplot(cor(rbind(train,test)[-c(3,57)]))
+```
+
+# Modeling
+To obtain a good prediciton, I will fit three models to the data. First, I train a simple classification tree to obtain a baseline and then I train two variants of extreme gradient boosting trees (xgboost), one using principal component analysis and one without. I will finally stack both xgboost models and train a final model. I train all models using the caret library and apply the internal (10-fold) cross validation. 
+
+## Model 1: Random forest
+```{r model_1, cache=TRUE}
+mdl_ctree <- train(train$type~., data=train, method="ctree",
+                preProcess = c("center", "scale"),
+                trControl = trainControl(method="cv"))
+pred_ctree <- predict(mdl_ctree, test)
+```
+
+## Model 2: Boosted Forest without PCA
+```{r model_2, cache=TRUE}
+mdl_xgb <- train(train$type~., data=train, method="xgbTree", 
+                 preProcess = c("center", "scale"),
+                 trControl = trainControl(method="cv"))
+pred_xgb <- predict(mdl_xgb, test)
+```
+
+## Model 3: Boosted Forest with PCA
+```{r model_3, cache=TRUE}
+mdl_xgb.pca <- train(train$type~., data=train, method="xgbTree",
+                     preProcess = c("center", "scale", "pca"),
+                     trControl = trainControl(method="cv"))
+pred_xgb.pca <- predict(mdl_xgb.pca, test)
+```
+
+## Model stacking of models 2 and 3
+```{r stacking, cache=TRUE}
+# Stack data
+stacked_data <- cbind(pred_ctree, pred_xgb, pred_xgb.pca, test$type)
+
+# Train final model using cross validation
+mdl_final <- train(stacked_data[,4] ~ stacked_data[,3] + stacked_data[,2] + stacked_data[,1], data=stacked_data, 
+                   method="xgbTree", trControl = trainControl(method="cv"))
+pred_final <- round(predict(mdl_final, stacked_data))
+```
+
+# Results
+In this section I present the results. First, I compute a number of metrics using the inherent confusionMatrix function and then provide the confusion matrices.
+
+```{r mod_comparison, cache=TRUE}
+c1 <- confusionMatrix(test$type,pred_ctree)
+c2 <- confusionMatrix(test$type,pred_xgb)
+c3 <- confusionMatrix(test$type,pred_xgb.pca)
+cc <- confusionMatrix(test$type,pred_final)
+mdls <- rbind(c1$overall, c2$overall, c3$overall, cc$overall)
+row.names(mdls) <-c("Model 1", "Model 2", "Model 3", "Stacked model") 
+kable(mdls, row.names=TRUE)
+```
+
+The above table clearly shows that the stacked model is only slightly better than model 2.
+
+```{r anova}
+results <- resamples(list(model1=mdl_ctree, model2=mdl_xgb, model3=mdl_xgb.pca))
+bwplot(results)
+```
+
+This boxplot demonstrates that model 2 is the only model that has a small confidence interval. Since the stacked model consists of both, it naturally choses most of model two's performance.
+
+## Confusion Matrices
+### Model 1
+The confusion matrix of the classification tree directly 
+```{r model_quality_1, cache=TRUE}
+kable(c1$table, row.names=TRUE)
+```
+
+### Model 2
+```{r model_quality_2, cache=TRUE}
+kable(c2$table, row.names=TRUE)
+```
+
+### Model 3
+```{r model_quality_3, cache=TRUE}
+kable(c3$table, row.names=TRUE)
+```
+
+### Stacked model
+```{r model_quality_4, cache=TRUE}
+kable(cc$table, row.names=TRUE)
+```
+
+The stacked model ovecomes the above issues and only misclassifies 23 of the observations. There is no pattern in the misclassifications.
+
+# Predict the testing dataset
+## Preparation
+I prepare the data to have the same columns as the training data and impute using the mean.
+
+```{r prepare_testing, cache=TRUE}
+# Remove unneccessary columns
+testing <- testing[names(testing) %in% names(train)]
+# Remove NAs by setting to mean
+for (i in 1:(ncol(train)-1)){
+  testing[which(is.na(testing[,i])),i] <- mean(testing[,i], na.rm=TRUE)
+}
+```
+
+## Prediction
+First, I predict using the tree models and then combine their predictions to predict using the stacked model.
+```{r predict_testing, cache=TRUE}
+setwd("D:/Users/ceuler/Documents/2 DataScience/coursera/course_08_week_04/assignment/")
+p1 <- predict(mdl_ctree,testing)
+p2 <- predict(mdl_xgb,testing)
+p3 <- predict(mdl_xgb.pca,testing)
+#p4 <- predict(mdl_final,cbind.data.frame(p1,p2,p3))
+write.csv(cbind(dat=testing,pred=p1),"testing_model1.csv", row.names = FALSE)
+write.csv(cbind(dat=testing,pred=p2),"testing_model2.csv", row.names = FALSE)
+write.csv(cbind(dat=testing,pred=p3),"testing_model3.csv", row.names = FALSE)
+```
